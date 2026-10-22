@@ -1,0 +1,192 @@
+# 文献挖掘检索配置
+#
+# 由 LLM 根据用户主题生成，人审后使用。
+# 跑法：python scripts/probe.py --config search_config.yaml
+#
+# 本示例主题：靶向 LNP 工艺开发（mRNA 载荷、T/NK/DC 细胞靶向、偶联化学）
+
+meta:
+  topic: "靶向 LNP 工艺开发"
+  created: "2026-10-21"
+  # 说明给谁看：这份配置怎么来的、边界在哪
+  scope: |
+    只收 mRNA 载荷（含 saRNA/circRNA），不收 siRNA/pDNA/CRISPR RNP。
+    平台只收 LNP + 脂质体，不收聚合物/无机/外泌体。
+    时间不设限。
+
+# ---------- 载荷 ----------
+# 决定「研究什么分子」。脚本会拼成 (载荷) AND (平台) AND (维度)
+load:
+  lib: '(mRNA[Title/Abstract] OR "messenger RNA"[Title/Abstract] OR saRNA[Title/Abstract] OR circRNA[Title/Abstract])'
+  # 评分用：摘要里出现这些词 → +2
+  terms: ["mRNA", "messenger RNA", "saRNA", "self-amplifying", "circRNA", "circular RNA"]
+
+# ---------- 平台 ----------
+platform:
+  lib: '("lipid nanoparticle*"[Title/Abstract] OR LNP[Title/Abstract] OR "ionizable lipid*"[Title/Abstract] OR liposom*[Title/Abstract])'
+  # 硬门槛：标题/摘要必须命中，否则踢进背景
+  required_pattern: "lipid nanopartic|\\bLNP|ionizable lipid|liposom|lipid vesicle"
+
+# ---------- 维度（核心）----------
+# 每条是一组检索式，脚本分别统计命中数。
+# 换主题时只改这里。
+#
+# scholar_query（可选）: Google Scholar 的检索词，必须纯英文。
+#   不写则自动取 terms/strong 里第一个英文词。
+#   坑: 用中文词（如「巯基-马来酰亚胺」）搜出来的是中文/日文泛综述，
+#   跟主题完全无关。所以强烈建议显式写英文。
+dimensions:
+
+  - key: cell_T
+    group: 细胞靶向
+    label: "T 细胞"
+    lib: '("T cell*"[Title/Abstract] OR "T-cell*"[Title/Abstract] OR CD3[Title/Abstract] OR CD4[Title/Abstract] OR CD8[Title/Abstract] OR CD7[Title/Abstract])'
+    # 评分用
+    terms: ["T cell", "T-cell", "CD3", "CD4", "CD8", "CD7", "CAR-T"]
+    scholar_query: "T cell targeted lipid nanoparticle mRNA"
+    weight: 1
+
+  - key: cell_NK
+    group: 细胞靶向
+    label: "NK 细胞"
+    lib: '("NK cell*"[Title/Abstract] OR "natural killer"[Title/Abstract] OR CD56[Title/Abstract])'
+    terms: ["NK cell", "natural killer", "CD56", "CAR-NK"]
+    scholar_query: "NK cell targeted lipid nanoparticle mRNA"
+    weight: 1
+
+  - key: cell_DC
+    group: 细胞靶向
+    label: "树突状细胞"
+    lib: '("dendritic cell*"[Title/Abstract] OR CD11c[Title/Abstract] OR "DEC-205"[Title/Abstract] OR CLEC9A[Title/Abstract])'
+    terms: ["dendritic cell", "CD11c", "DEC-205", "CLEC9A", "cDC1"]
+    scholar_query: "dendritic cell targeted lipid nanoparticle mRNA"
+    weight: 1
+
+  - key: cell_RBC
+    group: 细胞靶向
+    label: "红细胞"
+    lib: '(erythrocyte*[Title/Abstract] OR "red blood cell*"[Title/Abstract])'
+    terms: ["erythrocyte", "red blood cell", "RBC"]
+    scholar_query: "erythrocyte red blood cell targeted nanoparticle"
+    weight: 1
+
+  - key: cell_HSC
+    group: 细胞靶向
+    label: "造血干细胞 / 骨髓"
+    lib: '("hematopoietic stem cell*"[Title/Abstract] OR "bone marrow"[Title/Abstract] OR HSC[Title/Abstract])'
+    terms: ["hematopoietic stem cell", "haematopoietic", "HSC", "bone marrow"]
+    scholar_query: "hematopoietic stem cell targeted nanoparticle mRNA"
+    weight: 1
+
+  - key: chem_maleimide
+    group: 偶联化学
+    label: "巯基-马来酰亚胺"
+    lib: '(maleimide[Title/Abstract] OR "thiol-maleimide"[Title/Abstract] OR sulfhydryl[Title/Abstract] OR thiolation[Title/Abstract])'
+    # 强信号词：具体的、可验证的化学名
+    strong: ["maleimide", "thiol-maleimide", "sulfhydryl", "thiolation"]
+    scholar_query: "thiol maleimide conjugation lipid nanoparticle"
+    weight: 3
+
+  - key: chem_click
+    group: 偶联化学
+    label: "点击化学 / 生物正交"
+    lib: '(SPAAC[Title/Abstract] OR DBCO[Title/Abstract] OR CuAAC[Title/Abstract] OR tetrazine[Title/Abstract] OR "click chemistry"[Title/Abstract] OR "strain-promoted"[Title/Abstract])'
+    strong: ["SPAAC", "DBCO", "dibenzocyclooctyne", "CuAAC", "azide-alkyne", "tetrazine", "TCO", "trans-cyclooctene", "click chemistry", "bioorthogonal"]
+    scholar_query: "click chemistry bioorthogonal conjugation lipid nanoparticle"
+    weight: 3
+
+  - key: chem_other
+    group: 偶联化学
+    label: "其他共价偶联"
+    lib: '("NHS ester"[Title/Abstract] OR "N-hydroxysuccinimide"[Title/Abstract] OR sortase[Title/Abstract] OR SpyTag[Title/Abstract] OR "thiol-ene"[Title/Abstract])'
+    strong: ["NHS ester", "succinimidyl", "sortase", "SpyTag", "SpyCatcher", "thiol-ene", "Michael addition"]
+    scholar_query: "covalent conjugation lipid nanoparticle functionalization"
+    weight: 3
+
+  - key: chem_noncovalent
+    group: 偶联化学
+    label: "非共价偶联"
+    lib: '("non-covalent"[Title/Abstract] OR noncovalent[Title/Abstract] OR "Protein A"[Title/Abstract] OR "biotin-streptavidin"[Title/Abstract])'
+    strong: ["non-covalent", "noncovalent", "Protein A", "biotin-streptavidin", "His-tag", "polyhistidine"]
+    scholar_query: "non-covalent antibody conjugation lipid nanoparticle"
+    weight: 3
+
+  - key: proc_microfluidic
+    group: 工艺
+    label: "微流控"
+    lib: '("microfluidic*"[Title/Abstract] OR NanoAssemblr[Title/Abstract] OR "staggered herringbone"[Title/Abstract] OR "T-junction"[Title/Abstract])'
+    terms: ["microfluidic", "NanoAssemblr", "staggered herringbone", "T-junction", "hydrodynamic focusing"]
+    scholar_query: "microfluidic continuous flow lipid nanoparticle production"
+    weight: 3
+
+  - key: proc_params
+    group: 工艺
+    label: "工艺参数"
+    lib: '("flow rate ratio"[Title/Abstract] OR "N/P ratio"[Title/Abstract] OR "encapsulation efficiency"[Title/Abstract] OR "design of experiments"[Title/Abstract] OR "ligand density"[Title/Abstract])'
+    terms: ["flow rate ratio", "FRR", "aqueous-to-ethanol", "N/P ratio", "encapsulation efficiency", "EE%", "design of experiments", "DoE", "response surface", "ligand density", "antibody density", "ligands per particle"]
+    scholar_query: "flow rate ratio encapsulation efficiency lipid nanoparticle design of experiments"
+    weight: 3
+
+  - key: proc_postconj
+    group: 工艺
+    label: "后偶联 / 一步偶联"
+    lib: '("post-insertion"[Title/Abstract] OR "post-conjugation"[Title/Abstract] OR "one-step"[Title/Abstract] OR "pre-conjugation"[Title/Abstract])'
+    terms: ["post-insertion", "post-conjugation", "post-functionalization", "pre-conjugation", "one-step", "one-pot"]
+    scholar_query: "post-insertion versus one-step conjugation lipid nanoparticle"
+    weight: 3
+
+# ---------- 弱信号（只给 +1，避免误判）----------
+weak_terms:
+  - "targeted"
+  - "conjugated"
+  - "functionalized"
+  - "surface-modified"
+  - "antibody"
+  - "peptide"
+  - "ligand"
+
+# ---------- 对照设计 ----------
+control_pattern: "compared (with|to)|versus|\\bvs\\.?\\b|control (LNP|group|nanoparticle)|untargeted|naked mRNA|free mRNA"
+
+# ---------- 排除 ----------
+exclude_pattern: "^(correction|erratum|retraction|reply|comment on)"
+
+# ---------- 分层阈值 ----------
+# 计分方式已去掉「载荷加分」（只提到 mRNA 不该算相关），
+# 所以阈值比早期版本低。实测：core=6 时核心约占 4%。
+thresholds:
+  core: 6      # ≥6 进核心
+  periphery: 3 # 3–5 进外围，<3 背景
+
+# ---------- 采集参数 ----------
+harvest:
+  pubmed:
+    enabled: true
+    retmax: 3000
+  epmc:
+    enabled: true
+    page_size: 300
+  openalex:
+    enabled: true
+  datacite:
+    enabled: false     # 学位论文，按需开
+    resource_type: dissertation
+  scholar:
+    enabled: auto      # auto / true / false
+    # auto: 检测到可用浏览器会话就开，否则跳过
+    pages: 1            # 每个维度翻几页（1 页 = 10 条）
+    # 硬要求: 需 browser-use + 日常 Chrome（chrome://inspect 里勾了
+    # "Allow remote debugging"）。CDP 干净实例会被 Google 反爬拦死。
+    # 限速: 维度之间自动隔 10s。Scholar 对高频请求极敏感，
+    # 触发 "Sorry / automated queries" 后基本要等 24h。
+
+# ---------- 下载参数 ----------
+download:
+  tier: core           # core / periphery / all
+  channels:
+    - pmc_pdf          # pg.evaluate(fetch)
+    - openalex_pdf
+    - epmc_xml         # 仅当 PDF 不存在
+    - scholar_cluster  # 「所有版本」页里的作者自存档（需 browser-use）
+  delay_seconds: 3     # 每篇间隔
+  max_concurrent: 1

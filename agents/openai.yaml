@@ -1,0 +1,7 @@
+interface:
+  display_name: "文献挖掘工作流"
+  short_description: "从主题句生成检索式、探命中量、采集分诊、下载 OA 全文，产出分层文献清单"
+  default_prompt: "使用 $lit-mining 帮我系统性检索这个方向，把能下的开放获取全文都下载下来。"
+
+policy:
+  allow_implicit_invocation: true

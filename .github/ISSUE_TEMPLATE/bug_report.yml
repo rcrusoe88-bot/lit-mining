@@ -1,0 +1,48 @@
+name: Bug 报告
+description: 报告一个可复现的问题
+labels: bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        谢谢反馈。请把「复现步骤」和「实际结果 vs 预期结果」写清楚，
+        这两项决定了能不能快速定位。
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 实际发生了什么
+      description: 报错信息请贴完整 traceback，不要只贴最后一行
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 你期望什么
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 运行 `python scripts/xxx.py --...`
+        2. 看到 ...
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境
+      description: |
+        - 操作系统：
+        - Python 版本：
+        - 是否设了代理（HTTPS_PROXY）：
+        - `python scripts/common.py` 的输出（能看出是网络问题还是代码问题）：
+      render: shell
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 网络预检
+      options:
+        - label: 我确认过 `python scripts/common.py` 显示端点都通

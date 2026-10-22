@@ -1,0 +1,10 @@
+# 运行产物
+raw/
+out/
+pdfs/
+search_config.yaml
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
