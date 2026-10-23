@@ -311,7 +311,12 @@ def _one(r, a, adapter, i, total):
     # 只有「所有通道都查过、都没找到公开副本」才记 not_found；
     # 有通道报了网络/HTTP 错误时，那才是真实原因。
     r["access_note"] = "; ".join(notes) or "无可用的公开全文通道"
-    r["failure_reason"] = _pick([_classify(n) for n in notes]) if notes else "unknown"
+    # 有标识符说明确实查过（没找到公开副本 = not_found）；
+    # 一个标识符都没有才是「没查过 = unknown」。
+    looked = any((r.get(k) or "").strip()
+                 for k in ("pmcid", "doi", "pdf_url", "oa_url"))
+    r["failure_reason"] = _pick([_classify(n) for n in notes]) if notes \
+        else ("not_found" if looked else "unknown")
     print(f"[{i}/{total}] --   {title}  ({r['failure_reason']})")
     return False
 
