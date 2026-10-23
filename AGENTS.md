@@ -48,14 +48,18 @@ playwright install chromium
 python scripts/probe.py    --config search_config.yaml
 #    ↑ 把输出给用户看，等确认
 
+# raw/ 必须是全新或空目录：已有源 TSV 会被拒绝覆盖，避免旧结果混进新运行
 python scripts/harvest.py  --config search_config.yaml --out raw/
+
+# 可选：Google Scholar 补充源（必须在 triage 之前，否则不会进入本次分诊）
+#   前置条件见 PROTOCOL.md「Google Scholar」一节
+python scripts/scholar.py  --config search_config.yaml --out raw/
+
 python scripts/triage.py   --config search_config.yaml --raw raw/ --out out/scored.tsv
 python scripts/download.py --in out/scored.tsv --pdfdir pdfs/ --tier core
 python scripts/report.py   --in out/scored.tsv --pdfdir pdfs/ --out README.md
 
-# 可选：Google Scholar 补充源 + 自存档救援
-#   前置条件见 PROTOCOL.md「Google Scholar」一节
-python scripts/scholar.py --config search_config.yaml --out raw/
+# 可选：自存档救援（在下载之后）
 python scripts/scholar.py --rescue --in out/scored.tsv --pdfdir pdfs/ --tier core
 ```
 
@@ -164,11 +168,16 @@ browser-use --doctor        # daemon alive + active connections
 `scored.tsv` 的 `status` 只有四个值：
 
 ```
-full_text       拿到正文（PDF 或 XML）
+full_text       拿到正文（PDF 或 XML，且文件通过最低校验）
 si_only         只有补充材料（不算全文）
 abstract_only   只有摘要
 none            什么都没有
 ```
+
+失败细节在 `failure_reason`（network / http_error / invalid_content / not_found /
+unknown）与 `access_note`（通道 + HTTP 状态 + 异常摘要）。**不要据此推断期刊
+OA 政策或是否付费墙**——那需要另外的证据。最低校验只排除 HTML 伪装与明显截断，
+不证明论文身份。
 
 报告里不要用「已下载」这种模糊表述 —— 使用者需要知道到底拿到了什么。
 

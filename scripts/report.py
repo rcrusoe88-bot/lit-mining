@@ -15,13 +15,14 @@ import sys
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import log, read_tsv
+from common import has_full_text, log, read_tsv
 
+# 只描述「这次没拿到」的直接原因，不推断期刊政策或付费墙。
 PENDING_REASONS = {
-    "paywall": "付费墙（无 OA 版本）",
-    "no_oa": "该刊无 OA 政策",
-    "network": "网络不可达",
-    "no_si": "该刊无补充材料",
+    "network": "网络/请求失败",
+    "http_error": "HTTP 错误",
+    "invalid_content": "返回内容不是正文",
+    "not_found": "未找到公开全文",
     "unknown": "未尝试或原因不明",
 }
 
@@ -40,15 +41,20 @@ def table(rows, cols, heads, widths):
 
 
 def classify_pending(r):
+    """优先用下载阶段记录的结构化原因；旧表没有该列时才看 access_note。
+
+    不再从「无 OA」这类模糊文字推断期刊政策 —— 下载失败证明不了政策。
+    """
+    reason = (r.get("failure_reason") or "").strip().lower()
+    if reason in PENDING_REASONS:
+        return reason
     note = (r.get("access_note") or "").lower()
-    if "付费" in note or "paywall" in note or "订阅" in note:
-        return "paywall"
-    if "无 oa" in note or "no_oa" in note:
-        return "no_oa"
-    if "网络" in note or "network" in note or "403" in note or "超时" in note:
+    if "403" in note or "401" in note or "http" in note:
+        return "http_error"
+    if "超时" in note or "网络" in note or "timeout" in note:
         return "network"
-    if "si" in note or "补充" in note:
-        return "no_si"
+    if "非 pdf" in note or "不是正文" in note:
+        return "invalid_content"
     return "unknown"
 
 
@@ -67,9 +73,9 @@ def main():
 
     core = [r for r in rows if r.get("tier") == "核心"]
     periph = [r for r in rows if r.get("tier") == "外围"]
-    got = [r for r in rows if (r.get("pdf_path") or "").strip()]
+    # 全文 = 状态是 full_text 且文件确实可读；SI、失效路径都不算
     pending = [r for r in rows if r.get("tier") in ("核心", "外围")
-               and not (r.get("pdf_path") or "").strip()]
+               and not has_full_text(r, a.pdfdir)]
 
     topic = a.topic or "文献挖掘"
     L = [f"# {topic} · 文献清单\n"]
@@ -78,11 +84,11 @@ def main():
     L.append("## 概览\n")
     L.append("| 指标 | 核心层 | 外围层 | 合计 |")
     L.append("|---|---|---|---|")
+    core_got = len([r for r in core if has_full_text(r, a.pdfdir)])
+    periph_got = len([r for r in periph if has_full_text(r, a.pdfdir)])
     L.append(f"| 文献数 | {len(core)} | {len(periph)} | {len(core)+len(periph)} |")
-    L.append(f"| 已获全文 | {len([r for r in core if (r.get('pdf_path') or '').strip()])} | "
-             f"{len([r for r in periph if (r.get('pdf_path') or '').strip()])} | {len(got)} |")
-    L.append(f"| 待获取 | {len([r for r in core if not (r.get('pdf_path') or '').strip()])} | "
-             f"{len([r for r in periph if not (r.get('pdf_path') or '').strip()])} | {len(pending)} |")
+    L.append(f"| 已获全文 | {core_got} | {periph_got} | {core_got+periph_got} |")
+    L.append(f"| 待获取 | {len(core)-core_got} | {len(periph)-periph_got} | {len(pending)} |")
     L.append("")
 
     # 领域判断：命中强信号的分布
@@ -106,8 +112,9 @@ def main():
         L.append("")
         sparse = [(k, v) for k, v in dim_count.items() if v <= 3]
         if sparse:
+            # 只陈述本次检索的结果，不推断「研究空白」—— 篇数受检索式和源覆盖影响
             L.append(f"> 篇数 ≤3 的维度：{', '.join(f'{k}({v})' for k, v in sparse)}。"
-                     "这些方向在公开文献里极薄，既是空白也是机会。\n")
+                     "这反映的是**本次检索**的命中量，不能直接等同于该方向的研究空白。\n")
 
     # 分层清单
     for name, subset in (("核心层", core), ("外围层", periph)):
@@ -141,16 +148,24 @@ def main():
                            ["年", "标题", "DOI", "期刊"], [5, 60, 30, 26]))
             L.append("")
 
-    # 方法学
+    # 方法学：只写实现事实，不写本次运行没有记录的信息
+    srcs = Counter()
+    for r in rows:
+        for s in (r.get("src") or "").split("+"):
+            if s:
+                srcs[s] += 1
     L.append("## 方法学\n")
-    L.append("- **数据源**：PubMed（E-utilities）、Europe PMC（REST）、OpenAlex；")
-    L.append("  DataCite 可选（学位论文）。Google Scholar 视网络环境启用。")
+    L.append(f"- **数据源**（本次题录来源）：{', '.join(sorted(srcs)) or '无'}。")
+    L.append("  各源均为限量采集：PubMed 按 retmax、OpenAlex 每维度前 200 条、")
+    L.append("  DataCite 前两页，Europe PMC 按完整游标翻页。因此本清单**不是穷尽检索**。")
     L.append("- **去重**：DOI 优先，标题归一化兜底。")
-    L.append("- **打分**：标题 + 摘要联合打分。强信号词 +3，弱信号 +1，")
-    L.append("  载荷 +2，有对照 +2；阈值由配置决定。")
-    L.append("- **下载**：只取 OA。PMC PDF（页面上下文 fetch）→ OpenAlex PDF → EPMC XML。")
-    L.append("- **状态**：`full_text` / `si_only` / `abstract_only` / `none`，")
-    L.append("  不用「已下载」这种含糊表述。")
+    L.append("- **打分**：标题 + 摘要联合打分。维度强信号按配置权重计分，")
+    L.append("  弱信号在有强信号时才 +1，有对照设计 +2；阈值由配置决定。")
+    L.append("  分数反映**词表命中**，不是研究质量或证据等级。")
+    L.append("- **下载**：只取 OA。PMC 官方 S3 → 题录已有 PDF 直链 → OpenAlex PDF → EPMC XML。")
+    L.append("- **状态**：`full_text` / `si_only` / `abstract_only` / `none`；")
+    L.append("  只有状态为 `full_text` **且文件通过最低校验**才计入已获全文。")
+    L.append("  该校验只排除 HTML 伪装与明显截断，不证明文件内容与题录一致。")
     L.append("")
 
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
@@ -158,21 +173,20 @@ def main():
         f.write("\n".join(L))
     log(f"→ {a.out}")
 
-    # 单独出一份待办
-    if pending:
-        pdir = os.path.dirname(a.infile) or "."
-        ppath = os.path.join(pdir, "pending.md")
-        P = ["# 待获取清单\n", f"共 {len(pending)} 篇\n"]
-        buckets = defaultdict(list)
-        for r in pending:
-            buckets[classify_pending(r)].append(r)
-        for k, v in sorted(buckets.items(), key=lambda x: -len(x[1])):
-            P.append(f"\n## {PENDING_REASONS.get(k, k)}（{len(v)} 篇）\n")
-            P.append(table(v, ["year", "title", "doi", "pmid", "journal"],
-                           ["年", "标题", "DOI", "PMID", "期刊"], [5, 60, 30, 10, 26]))
-        with open(ppath, "w", encoding="utf-8") as f:
-            f.write("\n".join(P))
-        log(f"→ {ppath}")
+    # 待办每次都重写：待获取清零后不能留下上一轮的清单
+    pdir = os.path.dirname(a.infile) or "."
+    ppath = os.path.join(pdir, "pending.md")
+    P = ["# 待获取清单\n", f"共 {len(pending)} 篇\n"]
+    buckets = defaultdict(list)
+    for r in pending:
+        buckets[classify_pending(r)].append(r)
+    for k, v in sorted(buckets.items(), key=lambda x: -len(x[1])):
+        P.append(f"\n## {PENDING_REASONS.get(k, k)}（{len(v)} 篇）\n")
+        P.append(table(v, ["year", "title", "doi", "pmid", "journal", "access_note"],
+                       ["年", "标题", "DOI", "PMID", "期刊", "说明"], [5, 60, 30, 10, 26, 40]))
+    with open(ppath, "w", encoding="utf-8") as f:
+        f.write("\n".join(P))
+    log(f"→ {ppath}")
 
     return 0
 

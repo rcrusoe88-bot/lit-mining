@@ -106,6 +106,13 @@ python scripts/harvest.py --config search_config.yaml --out raw/
 
 **坑**：`esearch` 默认 `retmax` 会静默截断。`harvest.py` 内部已改成先查 count 再分页，不要绕过。
 
+**运行隔离**：采集只写全新（或空）目录。目录里已有任一源 TSV 时 `harvest.py`
+拒绝覆盖；开工写 `.incomplete`，全部指定源成功才删除，中途失败保留标记并非零退出。
+`triage.py` 见到标记直接拒绝。代价是不支持原地续采，换目录重跑即可。
+
+**限量说明**：PubMed 按 `retmax` 截断、OpenAlex 每维度前 200 条、DataCite 前两页。
+Europe PMC 按完整游标翻页。这些上限会在日志里标明，报告也据此声明「非穷尽检索」。
+
 **坑（实测，网络抖动导致静默丢数据）**：NCBI E-utilities 偶发
 `SSL: UNEXPECTED_EOF_WHILE_READING` 和 `RemoteDisconnected`。实测一次
 `esummary` 请求 100 个 PMID，重试 4 次全挂，**整批 100 条数据静默消失**
@@ -142,28 +149,28 @@ Scholar 能捞到 PubMed 漏掉的论文（会议论文、预印本、社论）�
 python scripts/scholar.py --config search_config.yaml --out raw/
 ```
 
-**坑（Europe PMC 查询解析器的三个怪癖，都实测过）**：
+**Europe PMC 的查询语法与 PubMed 不同，必须转换**（2026-10-23 实测）：
 
-1. **通配符几乎不工作。** `liposom*[Title/Abstract]` 在 PubMed 上 4788 命中，
-   在 EPMC 上只有 18；和其他词 AND 时更是直接归零。
-   *对策*：把 `词*` 展开成 `("词"[字段] OR "词s"[字段])`，每个变体都自带字段标签。
+| 写法 | 命中 |
+|---|---|
+| `mRNA[Title/Abstract] AND "lipid nanoparticle"[Title/Abstract]` | 926 |
+| `TITLE_ABS:mRNA AND TITLE_ABS:"lipid nanoparticle"` | 1786 |
 
-2. **OR 组越长结果越少，超过 6 个词就归零。** 实测同一组词：
-   ```
-   A AND (mRNA)                               → 102
-   A AND (mRNA OR circRNA)                    → 2
-   A AND (mRNA OR "messenger RNA")            → 21
-   A AND (mRNA OR "messenger RNA" OR circRNA) → 0    ← 三个词就没了
-   ```
-   同一查询在 PubMed 上是 878 —— 所以这是 EPMC 侧的解析缺陷，不是语料差异。
-   *对策*：把三个 OR 组（维度/载荷/平台）全部拆成单分支，组合成多个简单查询，
-   分别跑完再合并去重。实测命中从 0 变成 11633 / 1167 / 3314。
+PubMed 风格的 `[Title/Abstract]` 在 EPMC 上并非等价语法，命中数明显偏低。
+`common.epmc_query()` 做有限转换：只支持词项/引号短语/通配符/布尔括号 +
+`[Title|Abstract]` → `TITLE_ABS:`/`TITLE:`/`ABSTRACT:`。**遇到不支持的字段
+（如 `[MeSH Terms]`）直接报错**，不删标签硬搜。
 
-3. **负载高时 302 到不可达主机。** Location 指向
-   `http://rest-api-live.europepmc.org/europepmc/webservices/rest/?query=...`，
-   那个主机名直连会失败，而且路径结尾少了 `search` 这一段。
-   *对策*：`common.py` 的 `_FixRedirect` 把主机换成 `www.ebi.ac.uk`、
-   协议换成 https、补回 `search`。不处理就是随机 302 → RemoteDisconnected。
+之前版本曾把 OR 组拆成笛卡尔积、再截前 12 个组合，并把词尾猜成复数形式。
+实测原生字段语法下三项 OR 正常（1828 条），那些拆分不是必需的，且硬截断会
+永久漏掉后置维度分支——现已删除，每维度只发一条完整布尔查询。
+
+分页按 cursor 一直翻到底，不再有 5 页上限；请求失败、游标重复、取回条数
+少于 `hitCount` 都显式报错，不当成「没命中」或「已完成」。
+
+`/rest?query=...` 目前仍会被重定向到 `/rest/search`，但代码显式使用 `/search`。
+负载高时 EPMC 可能 302 到 `rest-api-live.europepmc.org`，`_FixRedirect`
+会把主机换回 `www.ebi.ac.uk` 并补回 `search` 段。
 
 **坑（都踩过）**：
 
@@ -190,16 +197,19 @@ python scripts/triage.py --config search_config.yaml --raw raw/ --out out/scored
 2. **打分**：标题 + 摘要联合打分（**绝不能只看标题**，实测只看标题会让核心层从 276 掉到 7）
 3. **分层**：`核心` / `外围` / `背景`
 
-打分规则：
+打分规则（与 `triage.py` 实现一致）：
 
 ```
-+3  命中 strong_terms（具体的、可验证的名词）
-+1  命中 weak_terms（泛化词汇）
-+2  有对照设计（compared with / versus / control）
-+2  命中 load_terms（载荷）
-+1  命中对象词（细胞类型 / 靶器官等）
-≥threshold → 核心，≥3 → 外围，否则背景
++weight  命中某个维度的 strong/terms 词表（每组只计一次，取该组 weight）
++1       命中 weak_terms —— 且该文至少命中一个强信号维度，避免泛词堆分
++2       有对照设计（compared with / versus / control）
+ 0       载荷词只记录（has_load），不加分
+硬门槛  标题或摘要必须命中 platform.required_pattern，且至少命中一个维度
+≥thresholds.core → 核心，≥thresholds.periphery → 外围，否则背景
 ```
+
+分数是**词表命中**的量化，不是研究质量、证据等级或技术价值评分。
+`has_load` 目前只记录不参与分层：范围约束要落到检索式里（载荷组进 `load.lib`）。
 
 ---
 
@@ -270,13 +280,20 @@ fetch 同域相对路径** —— 请求头/UA/TLS 指纹全是真浏览器的�
 python scripts/scholar.py --rescue --in out/scored.tsv --pdfdir pdfs/ --tier core
 ```
 
-每篇下载后记录状态：
+每篇下载后记录状态。`status` 只有四种值，失败细节另存 `failure_reason` 与 `access_note`：
 
 ```
-full_text   拿到正文（PDF 或 XML）
-none        没有 OA 版本
-paywall     有 OA 记录但实际被拦
+status           full_text / si_only / abstract_only / none
+failure_reason   network / http_error / invalid_content / not_found / unknown
+access_note      通道 + HTTP 状态 + 异常摘要（人看）
 ```
+
+`full_text` 必须同时满足「状态为 full_text」和「文件通过最低校验」
+（PDF 有 `%PDF-` 头与 `%%EOF` 尾、XML 可安全解析且含非空 body）。
+`si_only`（只有补充材料）不算正文，也不会因为文件格式合法被自动提升。
+
+**失败原因只描述本次下载，不推断期刊政策**：403 是访问被拒，超时是网络，
+桶里没有正文是没找到公开副本——三者都不等于「该刊无 OA」或「付费墙」。
 
 ---
 
@@ -288,8 +305,8 @@ python scripts/report.py --in out/scored.tsv --pdfdir pdfs/ --out README.md
 
 产出：
 
-- `README.md`：分层清单 + 方法学说明 + 领域判断
-- `out/pending.md`：未拿到的，**按原因分类**（付费墙 / 无 OA / 网络不可用 / 该刊无全文）
+- `README.md`：分层清单 + 方法学说明（只写本次真实来源与限量）
+- `out/pending.md`：未拿到的，按 `failure_reason` 分类；待获取清零时也会重写成空清单
 
 ---
 
@@ -360,10 +377,11 @@ python scripts/common.py
 `scored.tsv` 的 `status` 列只有这四个值：
 
 ```
-full_text       拿到正文
+full_text       拿到正文（且文件通过最低校验）
 si_only         只有补充材料（不算全文）
 abstract_only   只有摘要
 none            什么都没有
 ```
 
-不要用「已下载」这种模糊表述。
+不要用「已下载」这种模糊表述。`full_text` 不等于「文件一定正确」——最低校验
+只排除 HTML 伪装和明显截断，不验证论文身份，也不解析 PDF 结构。

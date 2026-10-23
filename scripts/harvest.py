@@ -27,21 +27,28 @@ import urllib.request as urllib_request
 from defusedxml import ElementTree as ET   # 防 XXE
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (DATACITE, EPMC, EUTILS, OPENALEX, UA, build_query,
-                    http_json, http_json_checked, load_config, log, preflight,
-                    write_tsv)
+from common import (DATACITE, EPMC, EUTILS, INCOMPLETE, OPENALEX, UA,
+                    build_query, epmc_query, http_json_checked, load_config,
+                    log, norm_doi, preflight, write_tsv)
 
-# Europe PMC 的查询数 = 维度项 × 载荷项 × 平台项，可能上百，
-# 串行要好几分钟。各查询彼此独立，用线程池并发。
+# 每维度一个完整 EPMC 查询；各维度并发，cursor 页内串行。
 EPMC_JOBS = 6
 
 
 # ---------- PubMed ----------
 
 def pm_search(term, retmax):
-    """先查 count，再分页取 ID。避免静默截断。"""
+    """先查 count，再分页取 ID。请求失败和短页不能当成零命中。"""
+    if retmax <= 0:
+        raise ValueError("PubMed retmax 必须大于 0")
     q = urllib.parse.urlencode({"db": "pubmed", "term": term, "retmode": "json", "retmax": "0"})
-    total = int(http_json(f"{EUTILS}/esearch.fcgi?{q}").get("esearchresult", {}).get("count", 0))
+    data = http_json_checked(f"{EUTILS}/esearch.fcgi?{q}")
+    result = data.get("esearchresult") if isinstance(data, dict) else None
+    if not isinstance(result, dict) or result.get("errorlist") or "count" not in result:
+        raise RuntimeError("PubMed count 响应无效")
+    total = int(result["count"])
+    if total < 0:
+        raise RuntimeError("PubMed count 不能为负数")
     if total == 0:
         return [], 0
     if total > retmax:
@@ -53,106 +60,95 @@ def pm_search(term, retmax):
             "db": "pubmed", "term": term, "retmode": "json",
             "retmax": str(step), "retstart": str(start),
         })
-        d = http_json(f"{EUTILS}/esearch.fcgi?{q}")
-        ids.extend(d.get("esearchresult", {}).get("idlist", []))
+        data = http_json_checked(f"{EUTILS}/esearch.fcgi?{q}")
+        result = data.get("esearchresult") if isinstance(data, dict) else None
+        page = result.get("idlist") if isinstance(result, dict) else None
+        if (not isinstance(page, list) or result.get("errorlist")
+                or len(page) < min(step, total - start)
+                or any(not isinstance(pid, str) or not pid.strip() for pid in page)):
+            raise RuntimeError(f"PubMed ID 页 {start} 响应无效或不足 count")
+        ids.extend(page)
+        if len(set(ids)) != len(ids):
+            raise RuntimeError(f"PubMed ID 页 {start} 出现重复 ID")
         time.sleep(0.4)
     return ids, total
 
 
-def pm_summary(pmids, batch=100):
-    """批量取题录。
+def _pm_summary_batch(pmids):
+    q = urllib.parse.urlencode({"db": "pubmed", "id": ",".join(pmids), "retmode": "json"})
+    data = http_json_checked(f"{EUTILS}/esummary.fcgi?{q}", tries=4)
+    result = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(result, dict):
+        raise RuntimeError("PubMed esummary 响应无效")
+    missing = [pid for pid in pmids if not isinstance(result.get(pid), dict)
+               or result[pid].get("error") or not (result[pid].get("title") or "").strip()]
+    if missing:
+        raise RuntimeError(f"PubMed 缺题录: {', '.join(missing[:10])}")
+    return {pid: result[pid] for pid in pmids}
 
-    每批 100 个 ID 是一次请求 = 一批数据。网络抖动时静默返回空
-    会让整批消失（实测拿到 0/120，而重试一次就全好），
-    所以这里用 checked 版本，失败就拆小批次重试。
-    """
+
+def pm_summary(pmids, batch=100):
+    """批量取题录；大批失败拆成 20 条重试，子批仍失败则向上抛出。"""
     out = {}
     for i in range(0, len(pmids), batch):
         chunk = pmids[i:i + batch]
-        q = urllib.parse.urlencode({"db": "pubmed", "id": ",".join(chunk), "retmode": "json"})
         try:
-            d = http_json_checked(f"{EUTILS}/esummary.fcgi?{q}", tries=4)
+            out.update(_pm_summary_batch(chunk))
         except RuntimeError as e:
-            # 降级：拆成小批重试，实在不行才丢
             log(f"  !! esummary 批次 {i} 失败，降级到 20/批: {str(e)[:50]}", err=True)
             for j in range(0, len(chunk), 20):
-                sub = chunk[j:j + 20]
-                q2 = urllib.parse.urlencode({"db": "pubmed", "id": ",".join(sub), "retmode": "json"})
-                try:
-                    d2 = http_json_checked(f"{EUTILS}/esummary.fcgi?{q2}", tries=4)
-                except RuntimeError as e2:
-                    log(f"  !! esummary 子批 {i}.{j} 也失败，丢弃 {len(sub)} 条: {str(e2)[:40]}", err=True)
-                    continue
-                for pid in sub:
-                    if pid in d2.get("result", {}):
-                        out[pid] = d2["result"][pid]
+                out.update(_pm_summary_batch(chunk[j:j + 20]))
                 time.sleep(0.5)
             continue
-        for pid in chunk:
-            if pid in d.get("result", {}):
-                out[pid] = d["result"][pid]
         time.sleep(0.6)
     return out
 
 
-def pm_abstracts(pmids, batch=50):
-    """批量取摘要。同样是「一次请求 = 一批数据」，失败必须能感知。
+def _pm_abstract_batch(pmids):
+    q = urllib.parse.urlencode({"db": "pubmed", "id": ",".join(pmids), "retmode": "xml"})
+    req = urllib_request.Request(f"{EUTILS}/efetch.fcgi?{q}", headers=UA)
+    with urllib_request.urlopen(req, timeout=120) as r:
+        root = ET.fromstring(r.read())
+    if root.tag != "PubmedArticleSet":
+        raise RuntimeError("PubMed efetch 响应无效")
+    out = {}
+    for art in root:
+        if art.tag not in ("PubmedArticle", "PubmedBookArticle"):
+            continue
+        pid = art.findtext(".//PMID")
+        if not pid:
+            raise RuntimeError("PubMed efetch 题录缺 PMID")
+        parts = []
+        for ab in art.iter("AbstractText"):
+            label = ab.get("Label") or ""
+            txt = "".join(ab.itertext()).strip()
+            if txt:
+                parts.append(f"{label}: {txt}" if label else txt)
+        out[pid] = " ".join(parts)  # 题录本身没有摘要是合法的空串。
+    missing = set(pmids) - out.keys()
+    if missing:
+        raise RuntimeError(f"PubMed efetch 缺题录: {', '.join(sorted(missing)[:10])}")
+    return out
 
-    降级策略同 pm_summary：大批失败就拆成 10 条一批重试。
-    batch 默认 50 而不是 100 —— efetch 返回的 XML 比 esummary 大得多，
-    实测 100 条一批时连接被掐的概率明显更高。
-    """
+
+def pm_abstracts(pmids, batch=50):
+    """批量取摘要；保留三次重试和 10 条子批降级，最终失败必须传播。"""
     out = {}
     for i in range(0, len(pmids), batch):
         chunk = pmids[i:i + batch]
-        q = urllib.parse.urlencode({"db": "pubmed", "id": ",".join(chunk), "retmode": "xml"})
-        root = None
         for attempt in range(3):
             try:
-                req = urllib_request.Request(f"{EUTILS}/efetch.fcgi?{q}", headers=UA)
-                with urllib_request.urlopen(req, timeout=120) as r:
-                    root = ET.fromstring(r.read())
+                out.update(_pm_abstract_batch(chunk))
                 break
             except Exception as e:
                 log(f"  !! 摘要批次 {i} 第 {attempt+1} 次失败: {str(e)[:50]}", err=True)
                 if attempt < 2:
                     time.sleep(2 * (attempt + 1))
-        if root is None:
-            # 降级：拆成 10 条一批
+        else:
             for j in range(0, len(chunk), 10):
-                sub = chunk[j:j + 10]
-                q2 = urllib.parse.urlencode({"db": "pubmed", "id": ",".join(sub), "retmode": "xml"})
-                try:
-                    req = urllib_request.Request(f"{EUTILS}/efetch.fcgi?{q2}", headers=UA)
-                    with urllib_request.urlopen(req, timeout=120) as r:
-                        root2 = ET.fromstring(r.read())
-                except Exception as e2:
-                    log(f"  !! 摘要子批 {i}.{j} 也失败，丢弃 {len(sub)} 条: {str(e2)[:40]}", err=True)
-                    continue
-                for art in root2.iter("PubmedArticle"):
-                    pid = art.findtext(".//PMID")
-                    if not pid:
-                        continue
-                    parts = []
-                    for ab in art.iter("AbstractText"):
-                        label = ab.get("Label") or ""
-                        txt = "".join(ab.itertext()).strip()
-                        if txt:
-                            parts.append(f"{label}: {txt}" if label else txt)
-                    out[pid] = " ".join(parts)
+                out.update(_pm_abstract_batch(chunk[j:j + 10]))
                 time.sleep(0.34)
             continue
-        for art in root.iter("PubmedArticle"):
-            pid = art.findtext(".//PMID")
-            if not pid:
-                continue
-            parts = []
-            for ab in art.iter("AbstractText"):
-                label = ab.get("Label") or ""
-                txt = "".join(ab.itertext()).strip()
-                if txt:
-                    parts.append(f"{label}: {txt}" if label else txt)
-            out[pid] = " ".join(parts)
         time.sleep(0.5)
     return out
 
@@ -161,12 +157,10 @@ def run_pubmed(cfg, dims):
     log("\n=== PubMed ===")
     retmax = (cfg.get("harvest", {}).get("pubmed", {}) or {}).get("retmax", 3000)
     hits = {}
-    total_union = 0
     for d in dims:
         q = build_query(cfg, d["lib"])
         ids, total = pm_search(q, retmax)
         log(f"  {d['key']:24s} {total:>6d} (取 {len(ids)})")
-        total_union = max(total_union, total)
         for pid in ids:
             hits.setdefault(pid, set()).add(d["key"])
         time.sleep(0.4)
@@ -180,11 +174,12 @@ def run_pubmed(cfg, dims):
     abs_map = pm_abstracts(ids)
     log(f"    摘要 {len(abs_map)}/{len(ids)}")
 
+    missing = set(ids) - recs.keys() | (set(ids) - abs_map.keys())
+    if missing:
+        raise RuntimeError(f"PubMed 题录或摘要请求未覆盖: {', '.join(sorted(missing)[:10])}")
     rows = []
     for pid in ids:
-        rec = recs.get(pid)
-        if not rec:
-            continue
+        rec = recs[pid]
         aids = {x.get("idtype"): x.get("value") for x in rec.get("articleids", [])}
         authors = rec.get("authors", [])
         rows.append({
@@ -205,212 +200,86 @@ def run_pubmed(cfg, dims):
 
 # ---------- Europe PMC ----------
 
-def _or_branches(lib):
-    """把一个检索式的顶层 OR 项拆开，返回各项的文本。
-
-    Europe PMC 的查询解析器对长 OR 组有缺陷：OR 的项越多，结果越少，
-    甚至直接归零。实测同一组词：
-        A AND (mRNA)                               -> 102
-        A AND (mRNA OR circRNA)                    -> 2
-        A AND (mRNA OR "messenger RNA")            -> 21
-        A AND (mRNA OR "messenger RNA" OR circRNA) -> 0   <- 三个词就没了
-
-    PubMed 同一查询是 878。所以这是 EPMC 侧的解析问题，不是语料差异。
-
-    修法：OR 组拆成单分支分别查，结果合并去重。
-    合并后约等于各分支之和，远好于 0。
-    """
-    lib = (lib or "").strip()
-    m = re.match(r"^\((.*)\)$", lib, re.S)
-    if not m:
-        return [lib]
-    inner = m.group(1)
-    parts, depth, buf = [], 0, ""
-    i = 0
-    while i < len(inner):
-        ch = inner[i]
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-        if depth == 0 and inner[i:i + 4] == " OR ":
-            parts.append(buf)
-            buf = ""
-            i += 4
-            continue
-        buf += ch
-        i += 1
-    parts.append(buf)
-    return [p.strip() for p in parts if p.strip()]
-
-
-def _epmc_queries(cfg, dim):
-    """给 Europe PMC 生成一组等价查询（每个都尽量简单）。
-
-    不用 build_query 的结果再解析 —— 直接按配置结构生成，
-    避免脆弱的查询串解析。
-
-    EPMC 的 OR 组有硬上限：组越长结果越少，6 个词就归零。
-    所以三个 OR 组（维度 / 载荷 / 平台）全部拆成单分支，
-    组合成多个简单查询，分别跑完再合并去重。
-
-    查询数 = 维度项 × 载荷项 × 平台项，可能爆掉。
-    上限 12 个，超了就按「维度固定、载荷平台取前几个」收敛。
-    """
-    # 先展开通配符（"T cell*" -> "T cell" OR "T cells"），再拆 OR 组。
-    # 顺序反了的话，展开会把 OR 组重新撑大，EPMC 那边就又归零了。
-    def expand_then_split(lib):
-        out = []
-        for p in _or_branches(lib or ""):
-            for v in _or_branches(_expand_wildcards(p)):
-                out.append(v)
-        return out or [""]
-
-    dim_parts = expand_then_split(dim.get("lib", ""))
-    load_parts = expand_then_split((cfg.get("load") or {}).get("lib", ""))
-    plat_parts = expand_then_split((cfg.get("platform") or {}).get("lib", ""))
-
-    # 维度词最长最具体，优先全保留
-    combos = []
-    for dp in dim_parts:
-        for lp in load_parts:
-            for pp in plat_parts:
-                segs = [s for s in (dp, lp, pp) if s]
-                combos.append(" AND ".join(f"({s})" for s in segs))
-
-    if len(combos) > 12:
-        # 收敛：维度全留，载荷平台按顺序取，直到 12
-        combos = combos[:12]
-
-    return combos
-
-
-def _expand_wildcards(q):
-    """把 PubMed 风格通配符展开成 OR 变体，供 Europe PMC 用。
-
-    Europe PMC 的通配符语义和 PubMed 不一致，实测差异很大：
-        liposom*[Title/Abstract]                → 18 命中（PubMed 4788）
-        (liposom*) AND (mRNA)                   → 4 命中
-        (liposom*) AND (microfluidic*)          → 0 命中（！）
-        (liposome OR liposomes) 各带字段标签      → 22 命中 ✅
-
-    带 * 的词在 EPMC 上几乎匹配不到东西，和其他条件 AND 时更是直接归零 ——
-    整路数据变成 0 条，却不报任何错，看起来像「这个方向没有文献」。
-
-    修法：把 `词*` 换成 `("词"[字段] OR "词s"[字段] OR "词es"[字段])`。
-    每个变体都自带字段标签 —— 括号整体带字段标签语义是错的。
-
-    PubMed 那条路不用改：那边通配符工作正常。
-    """
-    # "词*"（带引号，后面可能跟字段标签）
-    def repl_quoted(m):
-        base = m.group(1).rstrip("*").strip()
-        if not base:
-            return m.group(0)
-        field = m.group(2) or ""
-        vs = sorted({base, base + "s", base + "es"})
-        # 避免 "liposome" + es = "liposomees" 这种蠢变体
-        vs = [v for v in vs if not (v.endswith("es") and v[:-2].endswith("e"))]
-        return "(" + " OR ".join(f'"{v}"{field}' for v in vs) + ")"
-
-    q = re.sub(r'"([A-Za-z][A-Za-z0-9 _\-]*)\*"(\[Title/Abstract\])?', repl_quoted, q)
-
-    # 词* 紧跟 [ 字段（不带引号）
-    def repl_bare(m):
-        base = m.group(1).rstrip("*")
-        field = m.group(2) or ""
-        if not base:
-            return m.group(0)
-        vs = sorted({base, base + "s", base + "es"})
-        vs = [v for v in vs if not (v.endswith("es") and v[:-2].endswith("e"))]
-        return "(" + " OR ".join(f'"{v}"{field}' for v in vs) + ")"
-
-    q = re.sub(r'(?<![A-Za-z0-9"])([A-Za-z][A-Za-z0-9\-]*)\*(\[Title/Abstract\])?',
-               repl_bare, q)
-    return q
-
-
-def _epmc_one_query(q, page_size, max_pages=5):
-    """跑一个 EPMC 查询的所有页。返回 (结果列表, 命中数, 失败页数)。"""
-    out, hits, failed = [], 0, 0
-    cursor = "*"
-    for _ in range(max_pages):
+def _epmc_one_query(q, page_size):
+    """取完 cursor 全页；不足 hitCount 或响应异常必须失败。"""
+    if not 1 <= page_size <= 1000:
+        raise ValueError("EPMC page_size 必须在 1–1000 之间")
+    out, seen, cursors = [], set(), set()
+    cursor, hits = "*", None
+    while True:
+        cursors.add(cursor)
         params = {"query": q, "format": "json", "pageSize": str(page_size),
                   "cursorMark": cursor, "resultType": "core"}
-        data = http_json(f"{EPMC}?" + urllib.parse.urlencode(params), tries=4)
-        if not data:
-            failed += 1
-            time.sleep(1.5)
-            continue
-        res = data.get("resultList", {}).get("result", [])
-        if not hits:
-            hits = int(data.get("hitCount", 0) or 0)
-        if not res:
-            break
-        out.extend(res)
-        cursor = data.get("nextCursorMark", "")
-        if not cursor or len(res) < page_size:
-            break
+        data = http_json_checked(f"{EPMC}/search?" + urllib.parse.urlencode(params), tries=4)
+        result_list = data.get("resultList") if isinstance(data, dict) else None
+        res = result_list.get("result") if isinstance(result_list, dict) else None
+        if (not isinstance(data, dict) or data.get("error") or data.get("errMsg")
+                or "hitCount" not in data or not isinstance(res, list)):
+            raise RuntimeError("EPMC 响应无效：缺 hitCount/resultList.result 或返回错误")
+        count = int(data["hitCount"])
+        if count < 0 or (hits is not None and hits != count):
+            raise RuntimeError(f"EPMC hitCount 无效或分页间变化: {hits} → {count}")
+        hits = count
+        for rec in res:
+            if (not isinstance(rec, dict) or not rec.get("source") or not rec.get("id")
+                    or not (rec.get("title") or "").strip()):
+                raise RuntimeError("EPMC 缺题录: source/id/title")
+            key = (rec["source"], rec["id"])
+            if key in seen:
+                raise RuntimeError(f"EPMC 分页重复题录: {key}")
+            seen.add(key)
+            out.append(rec)
+        if len(out) > hits:
+            raise RuntimeError(f"EPMC 返回题录超过 hitCount: {len(out)}/{hits}")
+        if len(out) == hits:
+            return out, hits
+        next_cursor = data.get("nextCursorMark")
+        if isinstance(next_cursor, str) and next_cursor in cursors:
+            raise RuntimeError(f"EPMC 重复 cursor: {next_cursor}")
+        if not res or len(res) < page_size or not isinstance(next_cursor, str) or not next_cursor:
+            raise RuntimeError(f"EPMC 分页未完成: {len(out)}/{hits}")
+        cursor = next_cursor
         time.sleep(0.3)
-    return out, hits, failed
 
 
 def run_epmc(cfg, dims):
-    """Europe PMC 补漏 + 预印本。
-
-    EPMC 的查询解析器有三个怪癖（详见 PROTOCOL.md）：
-    通配符不工作、OR 组超过 6 个词就归零、负载高时 302 到不可达主机。
-    所以这里的查询由 _epmc_queries 拆成单分支的简单查询。
-
-    各查询彼此独立，可以并发跑 —— 串行的话 36 个查询要 6 分钟。
-    页内仍串行，因为 cursorMark 依赖上一页。
-    """
+    """每维度只跑一个共用转换后的完整查询，跨维度累积 hits。"""
     log("\n=== Europe PMC ===")
     page_size = (cfg.get("harvest", {}).get("epmc", {}) or {}).get("page_size", 100)
-    jobs = []
-    for d in dims:
-        for q in _epmc_queries(cfg, d):
-            jobs.append((d["key"], q))
-
-    log(f"  {len(jobs)} 个查询，并发 {EPMC_JOBS}")
-    rows, seen = [], set()
-    failed = 0
+    jobs = [(d["key"], epmc_query(cfg, d["lib"])) for d in dims]
+    log(f"  {len(jobs)} 个完整查询，并发 {EPMC_JOBS}")
+    rows, by_id, dim_hits = [], {}, {}
     with cf.ThreadPoolExecutor(max_workers=EPMC_JOBS) as pool:
-        futs = {pool.submit(_epmc_one_query, q, page_size): (k, q)
-                for k, q in jobs}
+        futs = {pool.submit(_epmc_one_query, q, page_size): key for key, q in jobs}
         for fut in cf.as_completed(futs):
-            key, q = futs[fut]
-            try:
-                res, hits, nfail = fut.result()
-            except Exception as e:
-                log(f"  {key:24s} 查询异常: {str(e)[:50]}", err=True)
-                failed += 1
-                continue
-            failed += nfail
+            dim = futs[fut]
+            res, hits = fut.result()
+            log(f"  {dim:24s} {hits:>6d} (取 {len(res)})")
             for r in res:
-                k = r.get("id", "")
-                if not k or k in seen:
+                key = (r["source"], r["id"])
+                dim_hits.setdefault(key, set()).add(dim)
+                if key in by_id:
                     continue
-                seen.add(k)
-                rows.append({
-                    "src": "epmc", "uid": k,
+                row = {
+                    "src": "epmc", "uid": r["id"], "epmc_source": r["source"],
                     "doi": r.get("doi", "") or "",
                     "pmid": r.get("pmid", "") or "",
                     "pmcid": r.get("pmcid", "") or "",
-                    "title": (r.get("title") or "").rstrip("."),
-                    "journal": (r.get("journalInfo", {}) or {}).get("journal", {}).get("title", "")
-                               or (r.get("bookOrReportDetails", {}) or {}).get("publisher", ""),
+                    "title": r["title"].rstrip("."),
+                    "journal": ((r.get("journalInfo") or {}).get("journal") or {}).get("title", "")
+                               or (r.get("bookOrReportDetails") or {}).get("publisher", ""),
                     "year": str(r.get("pubYear", "")),
                     "first_author": (r.get("authorString") or "").split(",")[0],
                     "pubtype": ";".join((r.get("pubTypeList") or {}).get("pubType", [])),
                     "abstract": (r.get("abstractText") or "")[:3000],
                     "is_oa": r.get("isOpenAccess", ""),
                     "in_pmc": r.get("inPMC", ""),
-                    "hits": key, "hit_count": 1,
-                })
+                }
+                by_id[key] = row
+                rows.append(row)
+    for key, row in by_id.items():
+        row.update(hits=";".join(sorted(dim_hits[key])), hit_count=len(dim_hits[key]))
     log(f"  合计 {len(rows)}")
-    if failed:
-        log(f"  注意: {failed} 个页面失败，这路数据不完整", err=True)
     return rows
 
 
@@ -466,37 +335,41 @@ def _openalex_query(cfg, dim):
 
 
 def run_openalex(cfg, dims):
-    """OpenAlex 主要用于补 OA 判定和 pdf_url，采集量有限（免费 API 慢）。
-
-    注意：国内直连 api.openalex.org 会超时（实测 21s 无响应），
-    需要设 HTTPS_PROXY 走代理。失败必须告警，不能静默。
-    """
+    """OA 补充源：每维度最多 200 条；请求失败必须传播。"""
     log("\n=== OpenAlex ===")
-    rows = []
-    seen = set()
-    failed = 0
+    log("  采集上限: 每维度仅取首 200 条（OA 补充，不保证全量召回）")
+    rows, seen = [], set()
     for d in dims:
         q = _openalex_query(cfg, d)
-        # OpenAlex 的 search 是自然语言，不是 PubMed 语法
         params = {"search": q, "per-page": "200",
                   "select": "id,doi,title,publication_year,primary_location,open_access"}
-        data = http_json(f"{OPENALEX}/works?" + urllib.parse.urlencode(params), tries=2)
-        if not data:
-            failed += 1
-            log(f"  {d['key']:24s} 失败（OpenAlex 直连国内常超时，可设 HTTPS_PROXY）", err=True)
-            continue
-        res = data.get("results", [])
-        log(f"  {d['key']:24s} {data.get('meta', {}).get('count', '?')}")
+        data = http_json_checked(f"{OPENALEX}/works?" + urllib.parse.urlencode(params), tries=2)
+        res = data.get("results") if isinstance(data, dict) else None
+        meta = data.get("meta") if isinstance(data, dict) else None
+        if (not isinstance(res, list) or not isinstance(meta, dict)
+                or "count" not in meta or data.get("error")):
+            raise RuntimeError("OpenAlex 响应无效: 缺 results/meta.count")
+        count = int(meta["count"])
+        if count < 0 or len(res) != min(count, 200):
+            raise RuntimeError(f"OpenAlex 首 200 条响应不完整: {len(res)}/{count}")
+        log(f"  {d['key']:24s} {count} (取 {len(res)}，上限 200)")
         for w in res:
-            doi = (w.get("doi") or "").replace("https://doi.org/", "")
-            if doi in seen:
+            if (not isinstance(w, dict) or not (w.get("id") or "").strip()
+                    or not (w.get("title") or "").strip()):
+                raise RuntimeError("OpenAlex 缺题录: work ID/title")
+            doi = norm_doi(w.get("doi"))
+            work_id = w["id"].rstrip("/").split("/")[-1]
+            if not work_id:
+                raise RuntimeError("OpenAlex 缺 work ID")
+            key = ("doi", doi) if doi else ("work", work_id)
+            if key in seen:
                 continue
-            seen.add(doi)
+            seen.add(key)
             loc = w.get("primary_location") or {}
             rows.append({
-                "src": "openalex", "uid": w.get("id", "").split("/")[-1],
+                "src": "openalex", "uid": work_id,
                 "doi": doi, "pmid": "", "pmcid": "",
-                "title": w.get("title") or "",
+                "title": w["title"],
                 "journal": ((loc.get("source") or {}).get("display_name") or ""),
                 "year": str(w.get("publication_year", "")),
                 "first_author": "", "pubtype": "", "abstract": "",
@@ -507,8 +380,6 @@ def run_openalex(cfg, dims):
             })
         time.sleep(0.5)
     log(f"  合计 {len(rows)}")
-    if failed:
-        log(f"  注意: {failed}/{len(dims)} 个维度失败，OpenAlex 这路数据不完整", err=True)
     return rows
 
 
@@ -516,27 +387,37 @@ def run_openalex(cfg, dims):
 
 def run_datacite(cfg, dims):
     log("\n=== DataCite（学位论文）===")
+    log("  采集上限: 每维度最多 2 页 × 100 条（补充源，不保证全量召回）")
     rtype = (cfg.get("harvest", {}).get("datacite", {}) or {}).get("resource_type", "dissertation")
     rows = []
     for d in dims:
         q = " AND ".join(f"({p})" for p in (d["lib"],))
         q = q.replace("[Title/Abstract]", "")
+        fetched = 0
         for page in range(1, 3):
             params = {"query": q[:800], "page[size]": "100", "page[number]": str(page)}
             if rtype:
                 params["resource-type-id"] = rtype
-            data = http_json(f"{DATACITE}?" + urllib.parse.urlencode(params), tries=3)
-            items = data.get("data", [])
-            if not items:
-                break
+            data = http_json_checked(f"{DATACITE}?" + urllib.parse.urlencode(params), tries=3)
+            items = data.get("data") if isinstance(data, dict) else None
+            if not isinstance(items, list) or data.get("errors"):
+                raise RuntimeError("DataCite 响应无效: 缺 data 或返回 errors")
+            fetched += len(items)
+            total = (data.get("meta") or {}).get("total")
+            if total is not None and fetched < min(int(total), page * 100):
+                raise RuntimeError(f"DataCite 第 {page} 页不完整: {fetched}/{total}")
             for it in items:
-                a = it.get("attributes", {})
-                titles = a.get("titles", [{}])
-                creators = a.get("creators", [{}])
+                a = it.get("attributes") if isinstance(it, dict) else None
+                if not isinstance(a, dict) or not it.get("id"):
+                    raise RuntimeError("DataCite 缺题录: id/attributes")
+                titles = a.get("titles") or []
+                creators = a.get("creators") or []
+                if not titles or not (titles[0].get("title") or "").strip():
+                    raise RuntimeError(f"DataCite 缺标题: {it['id']}")
                 rows.append({
-                    "src": "datacite", "uid": it.get("id", ""),
+                    "src": "datacite", "uid": it["id"],
                     "doi": a.get("doi", ""), "pmid": "", "pmcid": "",
-                    "title": (titles[0].get("title", "") if titles else "").rstrip("."),
+                    "title": titles[0]["title"].rstrip("."),
                     "journal": a.get("publisher", ""),
                     "year": str(a.get("publicationYear", "")),
                     "first_author": creators[0].get("name", "") if creators else "",
@@ -547,7 +428,7 @@ def run_datacite(cfg, dims):
             if len(items) < 100:
                 break
             time.sleep(0.5)
-        log(f"  {d['key']:24s} done")
+        log(f"  {d['key']:24s} 取 {fetched}（上限 2 页/200 条）")
     return rows
 
 
@@ -564,50 +445,48 @@ def main():
                     help="跳过连通性预检（网络已确认可用时）")
     a = ap.parse_args()
 
-    cfg = load_config(a.config)
-    dims = cfg.get("dimensions") or []
-    if not dims:
-        log("配置里没有 dimensions", err=True)
-        return 1
-
-    # 开工前先探网络。网络层故障会让采集静默返回空，
-    # 错误信息指向「没命中」而不是「网络不通」，排查成本极高。
-    if not a.skip_preflight:
-        ok, _ = preflight()
-        if not ok:
-            log("\n网络不可用，已中止。修好网络再跑（可加 --skip-preflight 强制跳过）。", err=True)
-            return 2
-        log("")
-
-    os.makedirs(a.out, exist_ok=True)
     want = set(x.strip() for x in a.sources.split(",") if x.strip())
     if a.with_theses:
         want.add("datacite")
+    unknown = want - {"pubmed", "epmc", "openalex", "datacite", "scholar"}
+    if not want or unknown:
+        log(f"必须指定有效 source，未知源: {', '.join(sorted(unknown)) or '(空)'}", err=True)
+        return 1
 
-    if "pubmed" in want:
-        rows = run_pubmed(cfg, dims)
-        write_tsv(os.path.join(a.out, "pubmed.tsv"), rows)
-        log(f"  → {a.out}/pubmed.tsv  ({len(rows)} 行)")
+    try:
+        if os.path.exists(a.out) and (not os.path.isdir(a.out) or os.listdir(a.out)):
+            raise RuntimeError(f"输出目录必须不存在或为空: {a.out}；请换一个新目录重跑")
+        cfg = load_config(a.config)
+        dims = cfg.get("dimensions") or []
+        if not dims:
+            raise RuntimeError("配置里没有 dimensions")
+        os.makedirs(a.out, exist_ok=True)
+        marker = os.path.join(a.out, INCOMPLETE)
+        with open(marker, "x", encoding="utf-8") as f:
+            f.write("采集中；仅当所有指定源成功后删除此标记。\n")
 
-    if "epmc" in want:
-        rows = run_epmc(cfg, dims)
-        write_tsv(os.path.join(a.out, "epmc.tsv"), rows)
-        log(f"  → {a.out}/epmc.tsv  ({len(rows)} 行)")
+        if not a.skip_preflight:
+            ok, _ = preflight()
+            if not ok:
+                log("\n网络不可用，已中止。修好网络后换新目录重跑。", err=True)
+                return 2
+            log("")
 
-    if "openalex" in want:
-        rows = run_openalex(cfg, dims)
-        write_tsv(os.path.join(a.out, "openalex.tsv"), rows)
-        log(f"  → {a.out}/openalex.tsv  ({len(rows)} 行)")
+        for source, run in (("pubmed", run_pubmed), ("epmc", run_epmc),
+                            ("openalex", run_openalex), ("datacite", run_datacite)):
+            if source in want:
+                rows = run(cfg, dims)
+                path = os.path.join(a.out, source + ".tsv")
+                write_tsv(path, rows)
+                log(f"  → {path}  ({len(rows)} 行)")
 
-    if "datacite" in want:
-        rows = run_datacite(cfg, dims)
-        write_tsv(os.path.join(a.out, "datacite.tsv"), rows)
-        log(f"  → {a.out}/datacite.tsv  ({len(rows)} 行)")
-
-    if "scholar" in want:
-        # Scholar 单独跑（要 browser-use 子进程 + 限速），不复用本文件的 HTTP 栈
-        import scholar as scholar_mod
-        scholar_mod.run_harvest(cfg, a.out)
+        if "scholar" in want:
+            import scholar as scholar_mod
+            scholar_mod.run_harvest(cfg, a.out, managed=True)
+        os.remove(marker)
+    except Exception as e:
+        log(f"采集失败: {e}", err=True)
+        return 1
 
     log("\n下一步: python scripts/triage.py --config ... --raw raw/ --out out/scored.tsv")
     return 0

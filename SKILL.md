@@ -81,8 +81,27 @@ python scripts/probe.py --config search_config.yaml
 
 ### 第 4 步：采集 + 分诊
 
+**采集必须写进一个全新的（或空的）目录**。`harvest.py` 见到已有源 TSV
+会拒绝覆盖——旧结果混进新运行，比跑失败难发现得多。想重跑就换目录。
+
 ```bash
 python scripts/harvest.py --config search_config.yaml --out raw/
+```
+
+采集期间目录里有 `.incomplete` 标记；只有**所有指定源都成功**才会删掉。
+中途失败会保留标记并以非零退出。`triage.py` 见到该标记直接拒绝，
+不会把半批数据当完整结果。
+
+可选加 Google Scholar（补充源，能捞到 PubMed 漏掉的论文）。**必须在 triage 之前跑完**，
+否则它写出的 `scholar.tsv` 不会进入本次分诊：
+
+```bash
+python scripts/scholar.py --config search_config.yaml --out raw/
+```
+
+需要 `browser-use` + 日常 Chrome（见下文「Google Scholar」）。**没有就跳过，不影响主流程。**
+
+```bash
 python scripts/triage.py --config search_config.yaml --raw raw/ --out out/scored.tsv
 ```
 
@@ -91,21 +110,20 @@ python scripts/triage.py --config search_config.yaml --raw raw/ --out out/scored
 - 核心为 0 → 词表太严或阈值太高
 - 核心 >30% → 弱信号被当成强信号了
 
-可选加 Google Scholar（补充源，能捞到 PubMed 漏掉的论文）：
-
-```bash
-python scripts/scholar.py --config search_config.yaml --out raw/
-```
-
-需要 `browser-use` + 日常 Chrome（见下文「Google Scholar」）。**没有就跳过，不影响主流程。**
-
 ### 第 5 步：下载
 
 ```bash
 python scripts/download.py --in out/scored.tsv --pdfdir pdfs/ --tier core
 ```
 
-**只下 OA**。拿不到的会标 `status: none`，交给报告分类。
+**只下 OA**。状态与真实原因写在 `status` / `failure_reason` / `access_note`：
+`failure_reason` 只说明这次为什么没拿到（network / http_error / invalid_content /
+not_found / unknown），**不能据此推断期刊 OA 政策或是否付费墙**。
+
+只有 `status=full_text` **且文件通过最低校验**（存在、PDF 头尾完整或 XML 可解析且有正文）
+才计入「已获全文」。校验只排除 HTML 伪装和明显截断，不证明文件与题录一致。
+
+每篇下载完立即回写 TSV，中断后已完成的状态不会丢。
 
 想再抢救一批（从 Scholar 的「所有版本」页找作者自存档）：
 

@@ -16,13 +16,15 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import load_config, log, norm_doi, norm_title, read_tsv, write_tsv
+from common import (INCOMPLETE, load_config, log, norm_doi, norm_title, read_tsv,
+                    write_tsv)
 
 FIELDS = [
     "tier", "score", "reasons", "year", "first_author", "title", "journal",
-    "doi", "pmid", "pmcid", "src", "n_hits", "hits",
+    "doi", "pmid", "pmcid", "src", "uid", "pubtype", "n_hits", "hits",
     "strong_hits", "weak_hits", "dim_hits",
-    "load_terms_hit", "status", "oa_status", "pdf_path", "access_note",
+    "load_terms_hit", "has_load", "abstract", "is_oa", "oa_url", "pdf_url", "url",
+    "status", "failure_reason", "oa_status", "pdf_path", "access_note",
     "cluster_url",
 ]
 
@@ -187,6 +189,13 @@ def main():
     a = ap.parse_args()
 
     cfg = load_config(a.config)
+
+    # 未完成的采集不能被当成完整输入（本地检查，先于任何读源）
+    if os.path.exists(os.path.join(a.raw, INCOMPLETE)):
+        log(f"{a.raw}/{INCOMPLETE} 存在：该目录的采集没有完整成功，拒绝分诊。"
+            f"换一个新目录重跑 harvest.py。", err=True)
+        return 1
+
     thr = cfg.get("thresholds") or {}
     thresholds = {
         "core": int(thr.get("core", 8)),
@@ -204,7 +213,9 @@ def main():
             all_rows.extend(rows)
             srcs += 1
     if not all_rows:
-        log(f"{a.raw}/ 里没有数据，先跑 harvest.py", err=True)
+        # 清掉上一轮评分表，否则报告会读到旧结果
+        write_tsv(a.out, [], FIELDS)
+        log(f"{a.raw}/ 里没有数据，先跑 harvest.py（已清空 {a.out}）", err=True)
         return 1
 
     log(f"\n合并前 {len(all_rows)}")

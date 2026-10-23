@@ -4,8 +4,12 @@
 
 只用标准库，保证任何 agent / 任何环境都能跑。
 """
+import csv
+import io
 import json
 import os
+import re
+import tempfile
 import socket
 import sys
 import time
@@ -23,6 +27,11 @@ EPMC = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 OPENALEX = "https://api.openalex.org"
 DATACITE = "https://api.datacite.org/dois"
 PMC_S3 = "https://pmc-oa-opendata.s3.amazonaws.com"
+
+# 采集中途的标记：harvest 开工创建、全部指定源成功后删除；triage 见到就拒绝。
+INCOMPLETE = ".incomplete"
+# 已知的采集落盘文件。新采集要求空目录，任一存在就说明这目录已被用过。
+SOURCE_TSVS = ("pubmed.tsv", "epmc.tsv", "openalex.tsv", "datacite.tsv", "scholar.tsv")
 
 
 def log(msg, err=False):
@@ -267,18 +276,158 @@ def read_tsv(path):
         return list(csv.DictReader(f, delimiter="\t"))
 
 
+def atomic_write(path, data, mode="wb"):
+    """同目录临时文件写完再替换。中途失败时保留旧文件。
+
+    用于 TSV 和 PDF/XML：半截文件一旦被当成缓存，比没下载更糟。
+    """
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=os.path.basename(path)[-16:])
+    try:
+        with os.fdopen(fd, mode) as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def write_tsv(path, rows, fields=None, encoding="utf-8-sig"):
-    """写 TSV。encoding 用 utf-8-sig 让 Excel 正确识别中文。"""
-    import csv
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    if not rows:
-        return
-    fields = fields or list(rows[0].keys())
-    with open(path, "w", encoding=encoding, newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields, delimiter="\t", extrasaction="ignore")
+    """原子写 TSV。encoding 用 utf-8-sig 让 Excel 正确识别中文。
+
+    空 rows 也必须替换旧文件 —— 否则上次运行的数据会被下一次当成结果。
+    未指定 fields 时汇总所有行的键：后面行新增的字段（如 failure_reason）
+    不能被 extrasaction="ignore" 悄悄丢掉。
+    """
+    if fields is None:
+        fields = []
+        seen = set()
+        for r in rows:
+            for k in r:
+                if k not in seen:
+                    seen.add(k)
+                    fields.append(k)
+    buf = io.StringIO(newline="")
+    if fields:
+        w = csv.DictWriter(buf, fieldnames=fields, delimiter="\t", extrasaction="ignore")
         w.writeheader()
         for r in rows:
-            w.writerow({k: str(r.get(k, "") or "").replace("\t", " ").replace("\n", " ") for k in fields})
+            w.writerow({k: str(r.get(k, "") if r.get(k) is not None else "")
+                        .replace("\t", " ").replace("\n", " ") for k in fields})
+    atomic_write(path, buf.getvalue().encode(encoding))
+
+
+# ---------- 全文最低校验 ----------
+
+_PDF_TAIL = 2048
+
+
+def file_ok(path, kind=None):
+    """判断本地文件是不是「像样的正文」。
+
+    只排除 HTML 伪装、明显截断、坏 XML —— 不证明 PDF 结构可解析，
+    也不证明文件对应该篇论文。真正需要解析全文时另说。
+    """
+    if not path or not os.path.isfile(path):
+        return False
+    kind = kind or os.path.splitext(path)[1].lower().lstrip(".")
+    try:
+        if kind == "pdf":
+            with open(path, "rb") as f:
+                if f.read(5) != b"%PDF-":
+                    return False
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                if size < 1024:
+                    return False
+                f.seek(max(0, size - _PDF_TAIL))
+                return b"%%EOF" in f.read()
+        if kind == "xml":
+            from defusedxml import ElementTree as ET
+            root = ET.parse(path).getroot()
+            if root.tag.split("}")[-1] != "article":
+                return False
+            body = next((e for e in root.iter() if e.tag.split("}")[-1] == "body"), None)
+            return body is not None and bool("".join(body.itertext()).strip())
+    except Exception:
+        return False
+    return False
+
+
+def has_full_text(row, base_dir="."):
+    """记录本身是否真的拿到了正文（状态 + 文件双重条件）。
+
+    si_only 不算正文；路径存在但文件坏了也不算。
+
+    相对路径有歧义：下载器存的是 `pdfs/x.pdf`（相对当时的工作目录），
+    而报告拿到的 --pdfdir 可能是 `pdfs` 也可能是绝对路径。所以按
+    「原样 → base_dir → base_dir 的父目录」依次试，命中即算。
+    最后一项是为了避免 `pdfs/pdfs/x.pdf` 这种双重拼接。
+    """
+    if (row.get("status") or "") != "full_text":
+        return False
+    p = (row.get("pdf_path") or "").strip()
+    if not p:
+        return False
+    if os.path.isabs(p):
+        return file_ok(p)
+    bases = [".", base_dir]
+    parent = os.path.dirname(os.path.abspath(base_dir))
+    if parent not in bases:
+        bases.append(parent)
+    return any(file_ok(os.path.join(b, p)) for b in bases)
+
+
+# ---------- Europe PMC 查询转换 ----------
+
+# 只认模板实际用到的 PubMed 字段。其余字段显式拒绝，别猜。
+_EPMC_FIELDS = {"title/abstract": "TITLE_ABS", "title": "TITLE", "abstract": "ABSTRACT"}
+# 括号单独成 token，即使紧贴词项（"(mRNA" → "(" "mRNA"）
+# 方括号内允许空格（"[MeSH Terms]"），所以字段标签单独匹配，不能靠 \S+ 贪吃
+_TOKEN = re.compile(r'"[^"]*"(?:\s*\[[^\]]*\])?|[()]|[^\s()\[\]]+(?:\s*\[[^\]]*\])?')
+_EPMC_SAFE_BARE = re.compile(r"^[A-Za-z0-9_\-*]+$")
+
+
+def _epmc_term(tok):
+    """一个词项（可带 [字段]）→ EPMC 原生写法。"""
+    m = re.match(r"^(.*?)(\[[^\]]*\])$", tok)
+    term, field = (m.group(1), m.group(2)[1:-1].strip().lower()) if m else (tok, None)
+    if field is not None:
+        if field not in _EPMC_FIELDS:
+            raise ValueError(f"Europe PMC 不支持字段 [{field}]")
+        if not (term.startswith('"') or _EPMC_SAFE_BARE.match(term)):
+            raise ValueError(f"无法安全转换的词项: {tok}")
+        return f"{_EPMC_FIELDS[field]}:{term}"
+    if term.upper() in ("AND", "OR", "NOT") or term in ("(", ")"):
+        return term
+    if term.startswith('"') or _EPMC_SAFE_BARE.match(term):
+        return term
+    raise ValueError(f"无法安全转换的词项: {tok}")
+
+
+def epmc_query(cfg, dim_lib):
+    """把 PubMed 检索式有限地翻成 Europe PMC 原生语法。
+
+    只支持词/短语 + [Title|Abstract] + 布尔与括号。不支持的写法直接报错，
+    不删标签硬搜 —— 静默改写查询比报错危险得多。
+    """
+    parts = [dim_lib, (cfg.get("load") or {}).get("lib", ""),
+             (cfg.get("platform") or {}).get("lib", "")]
+    out = []
+    for p in (x for x in parts if x):
+        try:
+            toks = [_epmc_term(t) for t in _TOKEN.findall(p)]
+        except ValueError as e:
+            raise ValueError(f"{e}（原文: {p[:120]}）") from None
+        if (toks[0].upper() in ("AND", "OR", "NOT") or toks[-1].upper() in ("AND", "OR", "NOT")
+                or not toks):
+            raise ValueError(f"检索式以布尔运算符开头或结尾（原文: {p[:120]}）")
+        out.append(" ".join(toks))
+    return " AND ".join(f"({p})" for p in out)
 
 
 def build_query(cfg, dim_lib):

@@ -16,19 +16,35 @@ import time
 import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (EUTILS, EPMC, build_query, http_json, load_config, log)
+from common import (EUTILS, EPMC, build_query, epmc_query, http_json_checked,
+                    load_config, log)
 
 
 def pubmed_count(term):
+    """失败要抛异常：把请求失败显示成 0 会让人误判「这个方向没有文献」。"""
     q = urllib.parse.urlencode({"db": "pubmed", "term": term, "retmode": "json", "retmax": "0"})
-    d = http_json(f"{EUTILS}/esearch.fcgi?{q}")
-    return int(d.get("esearchresult", {}).get("count", 0))
+    d = http_json_checked(f"{EUTILS}/esearch.fcgi?{q}")
+    res = d.get("esearchresult") if isinstance(d, dict) else None
+    if not isinstance(res, dict) or res.get("errorlist") or "count" not in res:
+        raise RuntimeError("PubMed count 响应无效")
+    count = int(res["count"])
+    if count < 0:
+        raise RuntimeError("PubMed count 不能为负数")
+    return count
 
 
 def epmc_count(query):
-    u = f"{EPMC}?" + urllib.parse.urlencode({"query": query, "format": "json", "pageSize": "1"})
-    d = http_json(u)
-    return int(d.get("hitCount", 0))
+    """query 是已转换好的 EPMC 原生检索式。"""
+    u = f"{EPMC}/search?" + urllib.parse.urlencode(
+        {"query": query, "format": "json", "pageSize": "1"})
+    d = http_json_checked(u)
+    if (not isinstance(d, dict) or d.get("error") or d.get("errMsg")
+            or "hitCount" not in d):
+        raise RuntimeError("Europe PMC count 响应无效")
+    count = int(d["hitCount"])
+    if count < 0:
+        raise RuntimeError("Europe PMC count 不能为负数")
+    return count
 
 
 def main():
@@ -58,10 +74,12 @@ def main():
     for gname, items in groups.items():
         print(f"--- {gname} ---")
         for d in items:
-            q = build_query(cfg, d["lib"])
-            n_pm = pubmed_count(q) if a.source in ("pubmed", "both") else None
+            n_pm = pubmed_count(build_query(cfg, d["lib"])) \
+                if a.source in ("pubmed", "both") else None
             time.sleep(0.35)
-            n_ep = epmc_count(q) if a.source in ("epmc", "both") else None
+            # EPMC 不认 PubMed 字段语法，必须走同一转换（与 harvest 一致）
+            n_ep = epmc_count(epmc_query(cfg, d["lib"])) \
+                if a.source in ("epmc", "both") else None
             time.sleep(0.35)
             label = d.get("label") or d["key"]
             if a.source == "both":
@@ -76,18 +94,24 @@ def main():
 
     # 全集（各维度 OR 起来）
     union_lib = " OR ".join(f"({d['lib']})" for d in dims)
-    union_q = build_query(cfg, union_lib)
-    n_union = pubmed_count(union_q)
+    union_counts = {}
+    if a.source in ("pubmed", "both"):
+        union_counts["pubmed"] = pubmed_count(build_query(cfg, union_lib))
+    if a.source in ("epmc", "both"):
+        union_counts["epmc"] = epmc_count(epmc_query(cfg, union_lib))
     print(f"--- 合并（各维度 OR）---")
-    print(f"  唯一命中           PubMed={n_union}")
-    results["_union"] = {"pubmed": n_union}
+    print("  唯一命中           " + " ".join(
+        f"{'PubMed' if source == 'pubmed' else 'EPMC'}={count}"
+        for source, count in union_counts.items()))
+    results["_union"] = union_counts
+    n_union = union_counts.get("pubmed", union_counts.get("epmc"))
 
     # 诊断提示
     print("\n诊断:")
-    narrow = [k for k, v in results.items()
-              if k != "_union" and isinstance(v.get("pubmed"), int) and v["pubmed"] < 10]
-    wide = [k for k, v in results.items()
-            if k != "_union" and isinstance(v.get("pubmed"), int) and v["pubmed"] > 5000]
+    narrow = [k for k, v in results.items() if k != "_union" and any(
+        isinstance(v.get(source), int) and v[source] < 10 for source in ("pubmed", "epmc"))]
+    wide = [k for k, v in results.items() if k != "_union" and any(
+        isinstance(v.get(source), int) and v[source] > 5000 for source in ("pubmed", "epmc"))]
     if narrow:
         print(f"  ⚠ 命中 <10 的维度（可能太窄或术语有误）: {', '.join(narrow)}")
     if wide:

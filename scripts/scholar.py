@@ -32,7 +32,8 @@ import time
 import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import http_bytes, load_config, log, norm_title, read_tsv, safe_name, write_tsv
+from common import (atomic_write, file_ok, has_full_text, http_bytes, load_config,
+                    log, norm_title, read_tsv, safe_name, write_tsv)
 
 SCHOLAR = "https://scholar.google.com/scholar"
 
@@ -94,15 +95,21 @@ def _run_snippet(code, timeout=180):
           errors="surrogatepass"，用 "replace" 会损坏 JSON 转义串
         - Windows 外层进程默认 GBK → 传 errors="replace" 给 subprocess，
           并建议以 UTF-8 模式跑本模块（python -X utf8）
+
+    超时 / 非零退出一律 raise：吞成「空结果」的话，限流和崩溃都会被
+    下游当成「Scholar 没搜到」，整批采集静默丢数据。
     """
     binname = shutil.which("browser-use") or os.path.expanduser("~/.local/bin/browser-use")
     if not os.path.exists(binname):
         raise RuntimeError("browser-use 不可用")
     try:
-        subprocess.run([binname], input=code, capture_output=True,
-                       timeout=timeout, encoding="utf-8", errors="replace")
+        r = subprocess.run([binname], input=code, capture_output=True,
+                           timeout=timeout, encoding="utf-8", errors="replace")
     except subprocess.TimeoutExpired:
-        pass
+        raise RuntimeError(f"browser-use 片段超时（{timeout}s）") from None
+    if r.returncode != 0:
+        raise RuntimeError(f"browser-use 退出码 {r.returncode}: "
+                           f"{(r.stderr or '')[-200:]}")
 
 
 def _collect(navigate_js, extract_js, wait=4):
@@ -209,11 +216,25 @@ os._exit(0)
         data = base64.b64decode(raw)
     except Exception:
         return None
-    if data[:5] != b"%PDF-":
+    if not _write_verified(dest, data):
         return None
-    with open(dest, "wb") as f:
-        f.write(data)
     return f"browser-use {len(data)//1024}KB"
+
+
+def _write_verified(dest, data):
+    """原子写盘 + 内容校验，返回是否可用。不合格立刻删掉。
+
+    只查 %PDF- 头不够：WAF 回半截 PDF 也能过。file_ok 还会查大小和
+    结尾 %%EOF，能挡住截断。所有通道都必须走这里，不许先写最终文件再报成功。
+    """
+    atomic_write(dest, data)
+    if file_ok(dest):
+        return True
+    try:
+        os.remove(dest)
+    except OSError:
+        pass
+    return False
 
 
 def download_pdf(url, dest, adapter=None):
@@ -225,9 +246,7 @@ def download_pdf(url, dest, adapter=None):
     """
     # 1. HTTP（大多数实验室主页/机构库够用）
     data, code = http_bytes(url, tries=2, timeout=90)
-    if data and data[:5] == b"%PDF-":
-        with open(dest, "wb") as f:
-            f.write(data)
+    if data and data[:5] == b"%PDF-" and _write_verified(dest, data):
         return f"http {len(data)//1024}KB"
 
     # 2. Playwright CDP（如果 9223 那个独立 Chrome 开着）
@@ -247,9 +266,7 @@ def download_pdf(url, dest, adapter=None):
             if res.get("ok"):
                 import base64
                 data = base64.b64decode(res["b64"])
-                if data[:5] == b"%PDF-":
-                    with open(dest, "wb") as f:
-                        f.write(data)
+                if data[:5] == b"%PDF-" and _write_verified(dest, data):
                     return f"cdp {len(data)//1024}KB"
         except Exception as e:
             log(f"  !! CDP 同源 fetch 失败: {str(e)[:60]}", err=True)
@@ -338,8 +355,18 @@ def _parse_meta(meta):
     return year, journal, author
 
 
-def run_harvest(cfg, outdir):
-    """采集模式：逐维度搜索 → raw/scholar.tsv。"""
+def run_harvest(cfg, outdir, managed=False):
+    """采集模式：逐维度搜索 → raw/scholar.tsv。
+
+    managed=True 时 raw 目录和 .incomplete 标记由 harvest 管理：
+    本函数不创建也不移除标记，只写 scholar.tsv。
+    managed=False（独立运行）时，已有 scholar.tsv 就拒绝覆盖 ——
+    整批搜索要几分钟还可能被限流，跑一半崩掉再重跑会把上次的好数据清空。
+    """
+    path = os.path.join(outdir, "scholar.tsv")
+    if not managed and os.path.exists(path):
+        raise RuntimeError(f"{path} 已存在，拒绝覆盖（先移走或删掉再跑）")
+
     scfg = (cfg.get("harvest") or {}).get("scholar") or {}
     pages = int(scfg.get("pages", 1))
     queries = build_queries(cfg)
@@ -363,7 +390,6 @@ def run_harvest(cfg, outdir):
             })
         log(f"    {len(res)} 条")
         time.sleep(10)      # 维度之间也隔 10s
-    path = os.path.join(outdir, "scholar.tsv")
     write_tsv(path, rows)
     log(f"  → {path}  ({len(rows)} 行)")
     return rows
@@ -379,12 +405,13 @@ def run_rescue(infile, pdfdir, tier=None, limit=20, delay=12):
     if not rows:
         log(f"{infile} 为空", err=True)
         return 1
-    want_tier = {"core": "核心", "periphery": "外围"}.get(tier)
+    # tier 已在 main 里转成中文；这里不能再映射一次，否则筛选永远落空
+    want_tier = tier if tier in ("核心", "外围") else \
+        {"core": "核心", "periphery": "外围"}.get(tier)
     todo = [r for r in rows
             if r.get("tier") in ("核心", "外围")
             and (want_tier is None or r.get("tier") == want_tier)
-            and (r.get("status") or "") != "full_text"
-            and not (r.get("pdf_path") or "").strip()]
+            and not has_full_text(r, pdfdir)]
     todo = todo[:limit]
     log(f"待补救 {len(todo)} 篇")
     os.makedirs(pdfdir, exist_ok=True)
@@ -392,12 +419,16 @@ def run_rescue(infile, pdfdir, tier=None, limit=20, delay=12):
     ok = 0
     for i, r in enumerate(todo, 1):
         title = (r.get("title") or "").strip()
+        r["failure_reason"] = ""
         if not title:
             continue
         res = scholar_search(f'"{title[:120]}"', pages=1)
         cluster = next((x.get("cluster") for x in res if x.get("cluster")), "")
         if not cluster:
+            r["failure_reason"] = "not_found"
+            r["access_note"] = "Scholar 无 cluster"
             print(f"[{i}/{len(todo)}] --  {title[:50]}（Scholar 无 cluster）")
+            write_tsv(infile, rows)      # 逐篇落盘，中断不丢已完成状态
             time.sleep(delay)
             continue
         # 只留真 PDF 直链，排除 scholar 自身的跳转链接
@@ -407,7 +438,12 @@ def run_rescue(infile, pdfdir, tier=None, limit=20, delay=12):
         for u in pdfs:
             base = safe_name(r.get("doi") or r.get("pmid") or norm_title(title)[:40])
             dest = os.path.join(pdfdir, base + ".pdf")
-            note = download_pdf(u, dest)
+            try:
+                note = download_pdf(u, dest)
+            except Exception as e:
+                # 子进程超时/崩溃现在会 raise；换下一个候选，别中断整批
+                log(f"  !! 下载失败 {u[:60]}: {str(e)[:60]}", err=True)
+                continue
             if note:
                 got = (dest, u, note)
                 break
@@ -417,12 +453,15 @@ def run_rescue(infile, pdfdir, tier=None, limit=20, delay=12):
             ok += 1
             print(f"[{i}/{len(todo)}] OK  {title[:50]}")
         else:
+            r["status"] = "none"
+            r["failure_reason"] = "not_found"
             r["access_note"] = "Scholar cluster 无可用 PDF"
             print(f"[{i}/{len(todo)}] --  {title[:50]}")
+        write_tsv(infile, rows)      # 逐篇落盘，中断不丢已完成状态
         time.sleep(delay)
 
-    if todo:
-        write_tsv(infile, rows)      # 回写状态
+    if not todo:
+        write_tsv(infile, rows)
     log(f"\n补救成功 {ok}/{len(todo)}")
     return 0
 
@@ -452,7 +491,13 @@ def main():
         return 0
     os.makedirs(a.out, exist_ok=True)
     log("=== Google Scholar（browser-use + 日常 Chrome）===")
-    return run_harvest(cfg, a.out) and 0
+    try:
+        # 独立运行：managed=False，已有 scholar.tsv 会被拒绝覆盖
+        run_harvest(cfg, a.out)
+    except Exception as e:
+        log(f"采集失败: {e}", err=True)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
