@@ -1,5 +1,5 @@
 # Core dependencies for the harvesting pipeline.
-PyYAML>=6.0
+PyYAML>=6.0.3
 defusedxml>=0.7
 
 # Optional: only needed for the Scholar channel, which drives a real browser.
