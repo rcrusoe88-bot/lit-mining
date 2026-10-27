@@ -24,7 +24,7 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pyyaml defusedxml
+          pip install -r requirements.txt
 
       # 逻辑检查不碰网络，任何环境都要过
       - name: Offline self-check
