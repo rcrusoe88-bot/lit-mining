@@ -1,6 +1,6 @@
 # Core dependencies for the harvesting pipeline.
 PyYAML>=6.0
-defusedxml>=0.7
+defusedxml>=0.7.1
 
 # Optional: only needed for the Scholar channel, which drives a real browser.
 # Install with: pip install playwright && playwright install chromium
